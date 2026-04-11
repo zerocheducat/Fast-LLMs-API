@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+requests
+torch
+pydantic
+gradio
+llama-cpp-python
+transformers

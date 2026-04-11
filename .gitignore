@@ -1,0 +1,17 @@
+
+__pycache__/
+*.py[cod]
+*$py.class
+
+
+launcher_config.json
+service_access.log
+
+
+venv/
+env/
+.env
+
+
+models/
+modles/
