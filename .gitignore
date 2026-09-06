@@ -15,3 +15,8 @@ env/
 
 models/
 modles/
+
+__pycache__/
+*.pyc
+launcher_config.json
+service_access.log
