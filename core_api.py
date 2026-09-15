@@ -4,6 +4,7 @@ import gc
 import inspect
 import json
 import os
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -56,6 +57,122 @@ if MAX_OUTPUT_TOKENS <= 0:
     raise RuntimeError("LLM_MAX_OUTPUT_TOKENS must be a positive integer")
 if MAX_OUTPUT_TOKENS > CTX_SIZE:
     raise RuntimeError("LLM_MAX_OUTPUT_TOKENS cannot exceed LLM_CTX_SIZE")
+
+
+# ---------------------------------------------------------------------------
+# 思考内容过滤
+#
+# 不同模型的思考标记不同，这里统一处理：
+#   - Qwen 系列:        <think>...</think>，或只出现 </think> 闭合标记
+#   - gpt-oss 系列:     <|channel|>analysis<|message|>...<|end|> 后跟 final 内容
+#   - 其它带 channel 的: <|channel|>thought<|message|>...<|end|>
+#
+# 需要支持新格式时，只需往下面的列表里加正则/标记即可，其它逻辑不用改。
+# ---------------------------------------------------------------------------
+
+_THINK_BLOCK_PATTERNS = [
+    re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE),
+    re.compile(r"<\|channel\|>analysis<\|message\|>.*?<\|end\|>", re.DOTALL | re.IGNORECASE),
+    re.compile(r"<\|channel\|>thought<\|message\|>.*?<\|end\|>", re.DOTALL | re.IGNORECASE),
+    re.compile(r"<\|channel\|>commentary<\|message\|>.*?<\|end\|>", re.DOTALL | re.IGNORECASE),
+]
+
+_FINAL_MARKERS = [
+    "<|channel|>final<|message|>",
+    "<|start|>assistant<|channel|>final<|message|>",
+]
+
+_END_MARKERS = ["</think>", "<|end|>"]
+
+# 流式过滤时，最多暂存这么多字符。超过则判断为“没有思考内容”，直接透传。
+_STREAM_MAX_DISCARD = 200
+
+
+def strip_thinking(text: Optional[str]) -> Optional[str]:
+    """移除模型输出中的思考/分析内容，只保留最终回答。"""
+    if not text:
+        return text
+
+    # 1. 移除完整的思考块
+    for pattern in _THINK_BLOCK_PATTERNS:
+        text = pattern.sub("", text)
+
+    # 2. 处理只有闭合标记的情况（如 Qwen 的 </think>）
+    if "</think>" in text:
+        text = text.split("</think>")[-1]
+
+    # 3. 处理 gpt-oss 的 final 标记：只保留 final 之后的内容
+    for marker in _FINAL_MARKERS:
+        if marker in text:
+            text = text.split(marker)[-1]
+
+    # 4. 清理残留的特殊标记
+    text = re.sub(r"<\|[^|]+\|>", "", text)
+    text = text.replace("</think>", "").replace("<think>", "")
+    return text.strip()
+
+
+class ThinkingStreamFilter:
+    """流式输出时逐块过滤思考内容。
+
+    设计：在遇到结束标记（</think> 或 <|end|>）之前，先暂存文本；
+    一旦遇到结束标记，就从标记之后开始输出。若暂存超过
+    _STREAM_MAX_DISCARD 仍未见结束标记，则判断该模型没有思考内容，
+    把缓冲直接透传。
+    """
+
+    def __init__(self) -> None:
+        self.buffer = ""
+        self.started = False
+
+    def feed(self, text: str) -> str:
+        if self.started:
+            return text
+
+        self.buffer += text
+
+        for marker in _END_MARKERS:
+            idx = self.buffer.find(marker)
+            if idx == -1:
+                continue
+            after = self.buffer[idx + len(marker):]
+            for fm in _FINAL_MARKERS:
+                fidx = after.find(fm)
+                if fidx != -1:
+                    after = after[fidx + len(fm):]
+                    break
+            self.buffer = ""
+            self.started = True
+            return after
+
+        if len(self.buffer) > _STREAM_MAX_DISCARD:
+            self.started = True
+            result = self.buffer
+            self.buffer = ""
+            return result
+
+        return ""
+
+    def flush(self) -> str:
+        if self.started:
+            return ""
+        result = strip_thinking(self.buffer)
+        self.buffer = ""
+        self.started = True
+        return result
+
+
+def _filter_response_message(response: Any) -> Any:
+    """对非流式响应中的 message.content 做思考内容过滤。"""
+    if not isinstance(response, dict):
+        return response
+    for choice in response.get("choices", []):
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message")
+        if isinstance(message, dict) and isinstance(message.get("content"), str):
+            message["content"] = strip_thinking(message["content"])
+    return response
 
 
 def _json_dumps(value: Any) -> str:
@@ -612,8 +729,42 @@ def _validate_chat_payload(payload: Any) -> Dict[str, Any]:
 
 
 def _sse_from_chunks(chunks: Iterable[Dict[str, Any]]) -> Iterator[str]:
+    thinker = ThinkingStreamFilter()
     for chunk in chunks:
-        yield f"data: {_json_dumps(_normalize_stream_chunk(chunk))}\n\n"
+        chunk = _normalize_stream_chunk(chunk)
+        choices = chunk.get("choices", [])
+        if isinstance(choices, list):
+            for choice in choices:
+                if not isinstance(choice, dict):
+                    continue
+                delta = choice.get("delta")
+                if not isinstance(delta, dict):
+                    continue
+                if isinstance(delta.get("content"), str):
+                    filtered = thinker.feed(delta["content"])
+                    if filtered:
+                        delta["content"] = filtered
+                    else:
+                        delta.pop("content", None)
+        yield f"data: {_json_dumps(chunk)}\n\n"
+
+    remaining = thinker.flush()
+    if remaining:
+        tail_chunk = {
+            "id": f"chatcmpl-{uuid.uuid4().hex}",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": MODEL_ID,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"content": remaining},
+                    "finish_reason": None,
+                }
+            ],
+        }
+        yield f"data: {_json_dumps(tail_chunk)}\n\n"
+
     yield "data: [DONE]\n\n"
 
 
@@ -629,7 +780,9 @@ def _sse_from_complete_response(response: Dict[str, Any], stream_options: Option
 
     content = message.get("content") if isinstance(message, dict) else None
     if isinstance(content, str) and content:
-        yield f"data: {_json_dumps({'id': chunk_id, 'object': 'chat.completion.chunk', 'created': created, 'model': MODEL_ID, 'choices': [{'index': 0, 'delta': {'content': content}, 'finish_reason': None}]})}\n\n"
+        content = strip_thinking(content)
+        if content:
+            yield f"data: {_json_dumps({'id': chunk_id, 'object': 'chat.completion.chunk', 'created': created, 'model': MODEL_ID, 'choices': [{'index': 0, 'delta': {'content': content}, 'finish_reason': None}]})}\n\n"
 
     tool_calls = message.get("tool_calls") if isinstance(message, dict) else None
     if isinstance(tool_calls, list) and tool_calls:
@@ -716,7 +869,8 @@ async def chat_endpoint(request: Request, token: str = Depends(verify_token)):
                 headers=headers,
             )
 
-        return result
+        # 非流式响应统一过滤思考内容
+        return _filter_response_message(result)
 
     except HTTPException as exc:
         print(f"[RequestRejected] status={exc.status_code} detail={exc.detail} | {_request_summary(raw_payload)}")
