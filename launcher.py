@@ -18,7 +18,9 @@ import requests
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(BASE_DIR, "service_access.log")
 CONFIG_FILE = os.path.join(BASE_DIR, "launcher_config.json")
+MODEL_KEYS_FILE = os.path.join(BASE_DIR, "model_api_keys.json")
 service_process = None
+monitor_process = None
 
 DSH_PROVIDER_ID_PATTERN = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
 
@@ -194,26 +196,72 @@ def initialize_app(language=LANG_EN):
     default_max_output = int(config.get("max_output_tokens", 2048))
     default_port = int(config.get("port", 7021))
     default_provider_id = str(config.get("dsh_provider_id", "fast-llms"))
+    default_reasoning_filter = str(config.get("reasoning_filter_mode", "strict")).strip().lower()
+    if default_reasoning_filter not in {"strict", "tagged", "off"}:
+        default_reasoning_filter = "strict"
     return (
         gpu_info, models, default_model, vram_free, init_eval, default_model_id,
         default_ctx, default_max_output, default_port, default_provider_id,
+        default_reasoning_filter,
     )
 
 
-def generate_secure_key(model_val, language=LANG_EN):
+def _model_key_identity(model_val):
     if not model_val:
+        return ""
+    value = str(model_val).strip()
+    if value.startswith("ollama://"):
+        return value
+    return os.path.normcase(os.path.abspath(os.path.normpath(value)))
+
+
+def load_model_keys():
+    if not os.path.exists(MODEL_KEYS_FILE):
+        return {}
+    try:
+        with open(MODEL_KEYS_FILE, "r", encoding="utf-8") as file:
+            data = json.load(file)
+        if isinstance(data, dict):
+            return {str(key): str(value) for key, value in data.items() if isinstance(value, str) and value}
+    except Exception:
+        pass
+    return {}
+
+
+def save_model_keys(keys):
+    with open(MODEL_KEYS_FILE, "w", encoding="utf-8") as file:
+        json.dump(keys, file, indent=4, ensure_ascii=False)
+
+
+def generate_secure_key(model_val, language=LANG_EN):
+    """Return the persistent API key for the selected model, creating it once if needed."""
+    identity = _model_key_identity(model_val)
+    if not identity:
         return "", ui_text(language, "Select a model first.", "请先选择一个模型。")
+
+    keys = load_model_keys()
+    existing = keys.get(identity)
+    if existing:
+        fingerprint = hashlib.sha256(existing.encode("utf-8")).hexdigest()[:12]
+        return existing, ui_text(
+            language,
+            f"Loaded the persistent API key for this model. Fingerprint: {fingerprint}",
+            f"已读取此模型的固定 API Key。指纹: {fingerprint}",
+        )
+
     secret_key = "sk-local-" + secrets.token_urlsafe(32)
+    keys[identity] = secret_key
+    save_model_keys(keys)
     fingerprint = hashlib.sha256(secret_key.encode("utf-8")).hexdigest()[:12]
     with open(LOG_FILE, "a", encoding="utf-8") as file:
         file.write(
             f"[{datetime.datetime.now().isoformat(sep=' ', timespec='seconds')}] "
-            f"EVENT:KEY_GEN | MODEL: {model_val} | KEY_SHA256_12: {fingerprint}\n"
+            f"EVENT:KEY_CREATE | MODEL: {identity} | KEY_SHA256_12: {fingerprint}\n"
         )
     return secret_key, ui_text(
         language,
-        f"A new API key was generated. Log fingerprint: {fingerprint}",
-        f"已生成新的 API Key。日志指纹: {fingerprint}",
+        f"Created a persistent API key for this model. Fingerprint: {fingerprint}",
+        f"已为此模型创建固定 API Key。指纹: {fingerprint}",
     )
 
 
@@ -225,7 +273,7 @@ def build_urls(port):
     )
 
 
-def launch_service(model_val, model_id, ctx_size, max_output_tokens, port, api_key, language=LANG_EN):
+def launch_service(model_val, model_id, ctx_size, max_output_tokens, port, api_key, reasoning_filter_mode, language=LANG_EN):
     global service_process
 
     if service_process is not None and service_process.poll() is not None:
@@ -265,6 +313,14 @@ def launch_service(model_val, model_id, ctx_size, max_output_tokens, port, api_k
     if service_process is not None:
         return ui_text(language, "Service is already running.", "服务已经在运行。"), base_url, chat_url
 
+    reasoning_filter_mode = str(reasoning_filter_mode or "strict").strip().lower()
+    if reasoning_filter_mode not in {"strict", "tagged", "off"}:
+        return ui_text(
+            language,
+            "Start failed: Reasoning Filter must be strict, tagged, or off.",
+            "启动失败：Reasoning Filter 只能是 strict、tagged 或 off。",
+        ), "", ""
+
     is_ollama = model_val.startswith("ollama://")
     real_model_path = model_val[len("ollama://"):] if is_ollama else model_val
     backend = "ollama" if is_ollama else "auto"
@@ -277,11 +333,13 @@ def launch_service(model_val, model_id, ctx_size, max_output_tokens, port, api_k
     env["LLM_MAX_OUTPUT_TOKENS"] = str(max_output_tokens)
     env["LLM_PORT"] = str(port)
     env["LLM_API_KEY"] = api_key
+    env["LLM_REASONING_FILTER_MODE"] = reasoning_filter_mode
     env["PYTHONIOENCODING"] = "utf-8"
 
     save_config_value("context_size", ctx_size)
     save_config_value("max_output_tokens", max_output_tokens)
     save_config_value("port", port)
+    save_config_value("reasoning_filter_mode", reasoning_filter_mode)
 
     script_path = os.path.join(BASE_DIR, "core_api.py")
     try:
@@ -304,7 +362,8 @@ def launch_service(model_val, model_id, ctx_size, max_output_tokens, port, api_k
         status += f"Backend: {backend}\n"
         status += f"API Model ID: {model_id.strip()}\n"
         status += f"Context Window: {ctx_size}\n"
-        status += f"Max Output Tokens: {max_output_tokens}{ollama_note}"
+        status += f"Max Output Tokens: {max_output_tokens}\n"
+        status += f"Reasoning Filter: {reasoning_filter_mode}{ollama_note}"
         return status, base_url, chat_url
     except Exception as exc:
         service_process = None
@@ -321,6 +380,90 @@ def terminate_service(language=LANG_EN):
     return ui_text(language, "Service is not running.", "服务未运行。"), "", ""
 
 
+def launch_monitor(port, api_key, language=LANG_EN):
+    global monitor_process
+
+    if not api_key:
+        return ui_text(
+            language,
+            "Monitor start failed: API Key is empty.",
+            "监控器启动失败：API Key 为空。",
+        )
+
+    script_path = os.path.join(BASE_DIR, "monitor.py")
+    if not os.path.exists(script_path):
+        return ui_text(
+            language,
+            f"Monitor start failed: {script_path} was not found.",
+            f"监控器启动失败：未找到 {script_path}。",
+        )
+
+    if monitor_process is not None and monitor_process.poll() is None:
+        return ui_text(
+            language,
+            "Performance monitor is already running.",
+            "性能监控器已经在运行。",
+        )
+
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return ui_text(
+            language,
+            "Monitor start failed: Service Port must be an integer.",
+            "监控器启动失败：服务端口必须是整数。",
+        )
+
+    env = os.environ.copy()
+    env["FAST_LLMS_BASE_URL"] = f"http://127.0.0.1:{port}"
+    env["FAST_LLMS_API_KEY"] = str(api_key)
+    env["PYTHONIOENCODING"] = "utf-8"
+
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+
+    try:
+        monitor_process = subprocess.Popen(
+            [sys.executable, script_path],
+            cwd=BASE_DIR,
+            env=env,
+            creationflags=creationflags,
+        )
+        return ui_text(
+            language,
+            "Performance monitor opened in a new terminal window.",
+            "性能监控器已在新的终端窗口中打开。",
+        )
+    except Exception as exc:
+        monitor_process = None
+        return ui_text(
+            language,
+            f"Monitor start failed: {exc}",
+            f"监控器启动失败：{exc}",
+        )
+
+
+def terminate_monitor(language=LANG_EN):
+    global monitor_process
+
+    if monitor_process is not None:
+        if monitor_process.poll() is None:
+            monitor_process.terminate()
+        monitor_process = None
+        return ui_text(
+            language,
+            "Performance monitor stopped.",
+            "性能监控器已停止。",
+        )
+
+    return ui_text(
+        language,
+        "Performance monitor is not running.",
+        "性能监控器未运行。",
+    )
+
+
 def on_scan_click(vram_free, language=LANG_EN):
     root = tk.Tk()
     root.withdraw()
@@ -330,7 +473,7 @@ def on_scan_click(vram_free, language=LANG_EN):
     )
     root.destroy()
     if not folder_path:
-        return gr.update(), gr.update(), gr.update()
+        return gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
 
     save_config_value("last_model_folder", folder_path)
     files = scan_gguf_files(folder_path)
@@ -339,12 +482,17 @@ def on_scan_click(vram_free, language=LANG_EN):
     selected = files[0] if files else (ollama_models[0] if ollama_models else None)
     if selected:
         eval_text, _ = estimate_vram_usage(selected, vram_free, language)
+        api_key, key_status = generate_secure_key(selected, language)
     else:
         eval_text = ui_text(language, "No GGUF or Ollama models found.", "未发现 GGUF 或 Ollama 模型。")
+        api_key, key_status = "", ""
     return (
         gr.Dropdown(choices=all_models, value=selected),
         eval_text,
         model_id_from_selection(selected),
+        api_key,
+        api_key,
+        key_status,
     )
 
 
@@ -354,7 +502,8 @@ def refresh_hardware_info(language=LANG_EN):
 
 def on_model_change(model, vram_free, language=LANG_EN):
     message, _ = estimate_vram_usage(model, vram_free, language)
-    return message, model_id_from_selection(model)
+    api_key, key_status = generate_secure_key(model, language)
+    return message, model_id_from_selection(model), api_key, api_key, key_status
 
 
 def toggle_key_visibility(visible):
@@ -640,16 +789,26 @@ def update_language(language):
         gr.update(label="API Model ID", info="此 API 向客户端公开的模型标识。" if zh else "Model identifier exposed by this API to connected clients."),
         gr.update(label="Context Window", info="GGUF 运行时上下文大小，同时作为 API 模型容量公开。" if zh else "Runtime context size for GGUF and the model capacity advertised by this API."),
         gr.update(label="Max Output Tokens", info="单次生成允许的最大输出长度。" if zh else "Maximum output length allowed for a single generation."),
+        gr.update(
+            label="Reasoning Filter",
+            info=(
+                "strict：最安全，会缓存无标签输出直到结束；tagged：仅遇到明确思考标签时过滤；off：不做思考过滤。"
+                if zh
+                else "strict: safest, buffers untagged output until completion; tagged: filters only explicit reasoning tags; off: no reasoning filtering."
+            ),
+        ),
         gr.update(label="显存提示" if zh else "VRAM Estimate"),
         gr.update(value="### 2. 鉴权" if zh else "### 2. Authentication"),
         gr.update(label="服务端口" if zh else "Service Port"),
         gr.update(label="API Key"),
         gr.update(value="显示/隐藏" if zh else "Show / Hide"),
         gr.update(value="复制" if zh else "Copy"),
-        gr.update(value="生成随机 API Key" if zh else "Generate Random API Key"),
+        gr.update(value="创建 / 读取模型 API Key" if zh else "Create / Load Model API Key"),
         gr.update(value="### 3. 运行" if zh else "### 3. Runtime"),
         gr.update(value="启动服务" if zh else "Start Service"),
         gr.update(value="停止服务" if zh else "Stop Service"),
+        gr.update(value="打开性能监控" if zh else "Open Performance Monitor"),
+        gr.update(value="关闭性能监控" if zh else "Close Monitor"),
         gr.update(label="OpenAI-compatible Base URL"),
         gr.update(label="Chat Completions URL"),
         gr.update(value="复制 Base URL" if zh else "Copy Base URL"),
@@ -704,8 +863,11 @@ with gr.Blocks(title="Fast LLMs API Console") as demo:
         init_max_output,
         init_port,
         init_provider_id,
+        init_reasoning_filter,
     ) = initialize_app(LANG_EN)
     vram_free_state.value = init_free
+    init_api_key, _ = generate_secure_key(init_default, LANG_EN) if init_default else ("", "")
+    current_key_value.value = init_api_key
 
     with gr.Group():
         with gr.Row(variant="panel"):
@@ -748,21 +910,34 @@ with gr.Blocks(title="Fast LLMs API Console") as demo:
                     info="Maximum output length allowed for a single generation.",
                     scale=2,
                 )
+                reasoning_filter_input = gr.Dropdown(
+                    label="Reasoning Filter",
+                    choices=["strict", "tagged", "off"],
+                    value=init_reasoning_filter,
+                    info=(
+                        "strict: safest but may delay untagged models; "
+                        "tagged: keeps normal streaming unless explicit reasoning tags appear; "
+                        "off: pass raw model output."
+                    ),
+                    scale=2,
+                )
             vram_status_bar = gr.Textbox(value=init_eval, label="VRAM Estimate", interactive=False)
 
             auth_section_md = gr.Markdown("### 2. Authentication")
             with gr.Row():
                 port_input = gr.Number(label="Service Port", value=init_port, precision=0, scale=1)
-                key_display = gr.Textbox(label="API Key", type="password", interactive=False, scale=3)
+                key_display = gr.Textbox(label="API Key", value=init_api_key, type="password", interactive=False, scale=3)
                 with gr.Column(scale=1):
                     btn_vis = gr.Button("Show / Hide", size="sm")
                     btn_copy = gr.Button("Copy", size="sm")
-            btn_gen_key = gr.Button("Generate Random API Key", variant="primary")
+            btn_gen_key = gr.Button("Create / Load Model API Key", variant="primary")
 
             runtime_section_md = gr.Markdown("### 3. Runtime")
             with gr.Row():
                 btn_start = gr.Button("Start Service", variant="primary", scale=2)
                 btn_stop = gr.Button("Stop Service", variant="stop", scale=1)
+                btn_monitor = gr.Button("Open Performance Monitor", variant="secondary", scale=1)
+                btn_monitor_stop = gr.Button("Close Monitor", variant="secondary", scale=1)
 
             base_url_display = gr.Textbox(label="OpenAI-compatible Base URL", interactive=False)
             chat_url_display = gr.Textbox(label="Chat Completions URL", interactive=False)
@@ -823,6 +998,7 @@ with gr.Blocks(title="Fast LLMs API Console") as demo:
         model_id_input,
         ctx_size_input,
         max_output_input,
+        reasoning_filter_input,
         vram_status_bar,
         auth_section_md,
         port_input,
@@ -833,6 +1009,8 @@ with gr.Blocks(title="Fast LLMs API Console") as demo:
         runtime_section_md,
         btn_start,
         btn_stop,
+        btn_monitor,
+        btn_monitor_stop,
         base_url_display,
         chat_url_display,
         btn_copy_base,
@@ -869,12 +1047,12 @@ with gr.Blocks(title="Fast LLMs API Console") as demo:
     model_dropdown.change(
         on_model_change,
         inputs=[model_dropdown, vram_free_state, language_select],
-        outputs=[vram_status_bar, model_id_input],
+        outputs=[vram_status_bar, model_id_input, current_key_value, key_display, status_output],
     )
     btn_scan.click(
         on_scan_click,
         inputs=[vram_free_state, language_select],
-        outputs=[model_dropdown, vram_status_bar, model_id_input],
+        outputs=[model_dropdown, vram_status_bar, model_id_input, current_key_value, key_display, status_output],
     )
     btn_gen_key.click(
         generate_secure_key,
@@ -891,13 +1069,32 @@ with gr.Blocks(title="Fast LLMs API Console") as demo:
 
     btn_start.click(
         launch_service,
-        inputs=[model_dropdown, model_id_input, ctx_size_input, max_output_input, port_input, current_key_value, language_select],
+        inputs=[
+            model_dropdown,
+            model_id_input,
+            ctx_size_input,
+            max_output_input,
+            port_input,
+            current_key_value,
+            reasoning_filter_input,
+            language_select,
+        ],
         outputs=[status_output, base_url_display, chat_url_display],
     )
     btn_stop.click(
         terminate_service,
         inputs=[language_select],
         outputs=[status_output, base_url_display, chat_url_display],
+    )
+    btn_monitor.click(
+        launch_monitor,
+        inputs=[port_input, current_key_value, language_select],
+        outputs=[status_output],
+    )
+    btn_monitor_stop.click(
+        terminate_monitor,
+        inputs=[language_select],
+        outputs=[status_output],
     )
     btn_copy_base.click(None, inputs=[base_url_display], js=js_copy)
     btn_copy_chat.click(None, inputs=[chat_url_display], js=js_copy)

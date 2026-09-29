@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
 import copy
+import ctypes
 import gc
 import inspect
 import json
 import os
 import re
+import sys
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -26,9 +29,14 @@ except ImportError:
 
 try:
     from llama_cpp import Llama
+    try:
+        import llama_cpp.llama_cpp as llama_cpp_low
+    except ImportError:
+        llama_cpp_low = None
     HAS_LLAMA_CPP = True
 except ImportError:
     Llama = None
+    llama_cpp_low = None
     HAS_LLAMA_CPP = False
 
 try:
@@ -50,6 +58,9 @@ MAX_OUTPUT_TOKENS = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "2048"))
 BACKEND_HINT = (os.getenv("LLM_BACKEND") or "auto").strip().lower()
 REQUEST_TIMEOUT = int(os.getenv("LLM_REQUEST_TIMEOUT", "600"))
 SERVER_CREATED = int(time.time())
+REASONING_FILTER_MODE = (os.getenv("LLM_REASONING_FILTER_MODE") or "strict").strip().lower()
+if REASONING_FILTER_MODE not in {"strict", "tagged", "off"}:
+    raise RuntimeError("LLM_REASONING_FILTER_MODE must be one of: strict, tagged, off")
 
 if CTX_SIZE <= 0:
     raise RuntimeError("LLM_CTX_SIZE must be a positive integer")
@@ -78,88 +89,241 @@ _THINK_BLOCK_PATTERNS = [
 ]
 
 _FINAL_MARKERS = [
-    "<|channel|>final<|message|>",
     "<|start|>assistant<|channel|>final<|message|>",
+    "<|channel|>final<|message|>",
 ]
 
-_END_MARKERS = ["</think>", "<|end|>"]
+_THINK_START_MARKERS = [
+    "<think>",
+    "<|channel|>analysis<|message|>",
+    "<|channel|>thought<|message|>",
+    "<|channel|>commentary<|message|>",
+    "<|start|>assistant<|channel|>analysis<|message|>",
+    "<|start|>assistant<|channel|>thought<|message|>",
+    "<|start|>assistant<|channel|>commentary<|message|>",
+]
 
-# 流式过滤时，最多暂存这么多字符。超过则判断为“没有思考内容”，直接透传。
-_STREAM_MAX_DISCARD = 200
+_STREAM_REMOVE_MARKERS = [
+    "<|start|>assistant<|channel|>final<|message|>",
+    "<|channel|>final<|message|>",
+    "<|start|>assistant",
+    "<|end|>",
+    "<think>",
+    "</think>",
+    r"\<think>",
+    r"\</think>",
+]
+
+
+def _normalize_reasoning_markers(text: str) -> str:
+    """
+    统一部分客户端/渲染器保留下来的转义 think 标签。
+
+    例如：
+        \\</think> -> </think>
+        \\<think>  -> <think>
+    """
+    return (
+        text.replace(r"\</think>", "</think>")
+            .replace(r"\<think>", "<think>")
+    )
 
 
 def strip_thinking(text: Optional[str]) -> Optional[str]:
-    """移除模型输出中的思考/分析内容，只保留最终回答。"""
+    """
+    移除非流式响应中的 reasoning / analysis 内容，
+    尽可能只保留最终回答。
+    """
     if not text:
         return text
 
-    # 1. 移除完整的思考块
+    text = _normalize_reasoning_markers(text)
+
+    # 1. 移除完整的 reasoning 块
     for pattern in _THINK_BLOCK_PATTERNS:
         text = pattern.sub("", text)
 
-    # 2. 处理只有闭合标记的情况（如 Qwen 的 </think>）
+    # 2. 某些 GGUF / chat template 不输出 <think>，
+    #    只在 reasoning 结束时输出 </think>。
+    #    此时 </think> 之前全部视为内部 reasoning。
     if "</think>" in text:
-        text = text.split("</think>")[-1]
+        text = text.rsplit("</think>", 1)[-1]
 
-    # 3. 处理 gpt-oss 的 final 标记：只保留 final 之后的内容
+    # 3. gpt-oss / Harmony：
+    #    final channel 是明确的最终回答起点。
     for marker in _FINAL_MARKERS:
         if marker in text:
-            text = text.split(marker)[-1]
+            text = text.rsplit(marker, 1)[-1]
 
-    # 4. 清理残留的特殊标记
+    # 4. 清理剩余特殊标记
     text = re.sub(r"<\|[^|]+\|>", "", text)
-    text = text.replace("</think>", "").replace("<think>", "")
+
+    text = (
+        text.replace("</think>", "")
+            .replace("<think>", "")
+            .replace(r"\</think>", "")
+            .replace(r"\<think>", "")
+    )
+
     return text.strip()
 
 
 class ThinkingStreamFilter:
-    """流式输出时逐块过滤思考内容。
+    """Filter reasoning/channel content in streaming responses.
 
-    设计：在遇到结束标记（</think> 或 <|end|>）之前，先暂存文本；
-    一旦遇到结束标记，就从标记之后开始输出。若暂存超过
-    _STREAM_MAX_DISCARD 仍未见结束标记，则判断该模型没有思考内容，
-    把缓冲直接透传。
+    Modes:
+      strict:
+        Safest mode. Buffer content until a </think> or Harmony final marker
+        appears. If no marker appears during the whole generation, release the
+        buffered response at the end. This also handles models that omit the
+        opening <think> tag.
+
+      tagged:
+        Preserve normal token-by-token streaming unless the response explicitly
+        starts with a known reasoning marker. Faster for ordinary chat models,
+        but it cannot safely hide a reasoning block that omits its opening tag.
+
+      off:
+        Do not filter reasoning. Pass raw model content through immediately.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, filter_mode: str = REASONING_FILTER_MODE) -> None:
+        mode = str(filter_mode or "strict").strip().lower()
+        if mode not in {"strict", "tagged", "off"}:
+            mode = "strict"
+
+        self.filter_mode = mode
         self.buffer = ""
-        self.started = False
+        self.pass_tail = ""
+
+        if mode == "off":
+            self.mode = "pass"
+        elif mode == "tagged":
+            self.mode = "detect"
+        else:
+            self.mode = "buffer"
+
+    @staticmethod
+    def _is_possible_think_prefix(text: str) -> bool:
+        return any(marker.startswith(text) for marker in _THINK_START_MARKERS)
+
+    @staticmethod
+    def _starts_with_thinking(text: str) -> bool:
+        return any(text.startswith(marker) for marker in _THINK_START_MARKERS)
+
+    def _sanitize_visible_stream(self, text: str, final: bool = False) -> str:
+        if self.filter_mode == "off":
+            return text
+
+        text = _normalize_reasoning_markers(text)
+        self.pass_tail += text
+
+        for marker in _STREAM_REMOVE_MARKERS:
+            self.pass_tail = self.pass_tail.replace(marker, "")
+
+        if final:
+            out = self.pass_tail
+            self.pass_tail = ""
+            return out
+
+        max_marker = max(len(marker) for marker in _STREAM_REMOVE_MARKERS)
+        keep = 0
+        limit = min(len(self.pass_tail), max_marker - 1)
+
+        for size in range(1, limit + 1):
+            suffix = self.pass_tail[-size:]
+            if any(marker.startswith(suffix) for marker in _STREAM_REMOVE_MARKERS):
+                keep = size
+
+        if keep:
+            out = self.pass_tail[:-keep]
+            self.pass_tail = self.pass_tail[-keep:]
+            return out
+
+        out = self.pass_tail
+        self.pass_tail = ""
+        return out
+
+    def _consume_final_boundary(self) -> Optional[str]:
+        final_pos = -1
+        final_marker = None
+
+        for marker in _FINAL_MARKERS:
+            pos = self.buffer.find(marker)
+            if pos != -1 and (final_pos == -1 or pos < final_pos):
+                final_pos = pos
+                final_marker = marker
+
+        if final_marker is not None:
+            visible = self.buffer[final_pos + len(final_marker):]
+            self.buffer = ""
+            self.mode = "pass"
+            return self._sanitize_visible_stream(visible)
+
+        close_pos = self.buffer.find("</think>")
+        if close_pos != -1:
+            visible = self.buffer[close_pos + len("</think>"):]
+            self.buffer = ""
+            self.mode = "pass"
+            return self._sanitize_visible_stream(visible)
+
+        return None
 
     def feed(self, text: str) -> str:
-        if self.started:
+        if not text:
+            return ""
+
+        if self.filter_mode == "off":
             return text
+
+        text = _normalize_reasoning_markers(text)
+
+        if self.mode == "pass":
+            return self._sanitize_visible_stream(text)
 
         self.buffer += text
 
-        for marker in _END_MARKERS:
-            idx = self.buffer.find(marker)
-            if idx == -1:
-                continue
-            after = self.buffer[idx + len(marker):]
-            for fm in _FINAL_MARKERS:
-                fidx = after.find(fm)
-                if fidx != -1:
-                    after = after[fidx + len(fm):]
-                    break
-            self.buffer = ""
-            self.started = True
-            return after
+        boundary_result = self._consume_final_boundary()
+        if boundary_result is not None:
+            return boundary_result
 
-        if len(self.buffer) > _STREAM_MAX_DISCARD:
-            self.started = True
-            result = self.buffer
-            self.buffer = ""
-            return result
+        if self.filter_mode == "tagged" and self.mode == "detect":
+            probe = self.buffer.lstrip()
+            if not probe:
+                return ""
 
+            if self._starts_with_thinking(probe):
+                self.mode = "thinking"
+                return ""
+
+            if self._is_possible_think_prefix(probe):
+                return ""
+
+            visible = self.buffer
+            self.buffer = ""
+            self.mode = "pass"
+            return self._sanitize_visible_stream(visible)
+
+        # strict mode, or tagged mode after an explicit reasoning marker:
+        # hold everything until a final boundary appears.
         return ""
 
     def flush(self) -> str:
-        if self.started:
+        if self.filter_mode == "off":
+            self.buffer = ""
             return ""
-        result = strip_thinking(self.buffer)
+
+        if self.mode == "pass":
+            visible = self._sanitize_visible_stream("", final=True)
+            self.buffer = ""
+            return visible
+
+        # No final boundary was observed. In strict mode this is treated as a
+        # normal non-reasoning answer and released at the end.
+        visible = strip_thinking(self.buffer) or ""
         self.buffer = ""
-        self.started = True
-        return result
+        self.mode = "pass"
+        return visible
 
 
 def _filter_response_message(response: Any) -> Any:
@@ -331,6 +495,14 @@ class ModelEngine:
             "tools",
             "tool_choice",
             "top_p",
+            "top_k",
+            "min_p",
+            "typical_p",
+            "repeat_penalty",
+            "tfs_z",
+            "mirostat_mode",
+            "mirostat_tau",
+            "mirostat_eta",
             "stop",
             "seed",
             "response_format",
@@ -342,6 +514,13 @@ class ModelEngine:
                 kwargs[key] = payload[key]
 
         kwargs = self._check_llama_cpp_call_support(kwargs)
+
+        if llama_cpp_low is not None and hasattr(llama_cpp_low, "llama_perf_context_reset"):
+            try:
+                llama_cpp_low.llama_perf_context_reset(self.engine.ctx)
+            except Exception:
+                pass
+
         result = self.engine.create_chat_completion(**kwargs)
 
         if payload.get("stream"):
@@ -623,6 +802,285 @@ class ModelEngine:
 
 engine_instance = ModelEngine()
 
+METRICS_LOCK = threading.RLock()
+METRICS_HISTORY_LIMIT = 24
+RUNTIME_METRICS: Dict[str, Any] = {
+    "server_started": SERVER_CREATED,
+    "requests_total": 0,
+    "active_request": None,
+    "last_request": None,
+    "history": [],
+}
+
+
+def _classify_request(payload: Dict[str, Any]) -> str:
+    tools = payload.get("tools")
+    if isinstance(tools, list) and tools:
+        return "tool"
+
+    messages = payload.get("messages")
+    if isinstance(messages, list) and len(messages) == 1:
+        message = messages[0]
+        if isinstance(message, dict):
+            content = message.get("content")
+            if (
+                message.get("role") == "user"
+                and isinstance(content, str)
+                and content.startswith("Summarize the following conversation into a concise title")
+            ):
+                return "title"
+
+    return "chat"
+
+
+def _process_memory_snapshot() -> Dict[str, Any]:
+    """Return current process memory without requiring psutil."""
+    if os.name == "nt":
+        try:
+            class PROCESS_MEMORY_COUNTERS_EX(ctypes.Structure):
+                _fields_ = [
+                    ("cb", ctypes.c_ulong),
+                    ("PageFaultCount", ctypes.c_ulong),
+                    ("PeakWorkingSetSize", ctypes.c_size_t),
+                    ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t),
+                    ("PeakPagefileUsage", ctypes.c_size_t),
+                    ("PrivateUsage", ctypes.c_size_t),
+                ]
+
+            counters = PROCESS_MEMORY_COUNTERS_EX()
+            counters.cb = ctypes.sizeof(counters)
+            handle = ctypes.windll.kernel32.GetCurrentProcess()
+            ok = ctypes.windll.psapi.GetProcessMemoryInfo(
+                handle,
+                ctypes.byref(counters),
+                counters.cb,
+            )
+            if ok:
+                return {
+                    "working_set_mb": round(counters.WorkingSetSize / (1024 * 1024), 1),
+                    "private_mb": round(counters.PrivateUsage / (1024 * 1024), 1),
+                    "peak_working_set_mb": round(counters.PeakWorkingSetSize / (1024 * 1024), 1),
+                }
+        except Exception:
+            pass
+
+    if sys.platform.startswith("linux"):
+        try:
+            page_size = os.sysconf("SC_PAGE_SIZE")
+            with open("/proc/self/statm", "r", encoding="utf-8") as file:
+                values = file.read().split()
+            resident = int(values[1]) * page_size
+            return {"working_set_mb": round(resident / (1024 * 1024), 1)}
+        except Exception:
+            pass
+
+    return {}
+
+
+def _gguf_perf_snapshot() -> Dict[str, Any]:
+    """Read llama.cpp runtime counters when the installed binding exposes them."""
+    if (
+        engine_instance.mode != "gguf"
+        or engine_instance.engine is None
+        or llama_cpp_low is None
+        or not hasattr(llama_cpp_low, "llama_perf_context")
+    ):
+        return {}
+
+    try:
+        perf = llama_cpp_low.llama_perf_context(engine_instance.engine.ctx)
+        context_tokens = int(getattr(engine_instance.engine, "n_tokens", 0) or 0)
+        prompt_eval_tokens = max(0, int(getattr(perf, "n_p_eval", 0) or 0))
+        completion_tokens = max(0, int(getattr(perf, "n_eval", 0) or 0))
+
+        # llama.cpp keeps the reused prefix in the live context while n_p_eval
+        # counts only prompt tokens actually evaluated during this request.
+        prompt_tokens = max(0, context_tokens - completion_tokens)
+        reused_prompt_tokens = max(0, prompt_tokens - prompt_eval_tokens)
+
+        prompt_eval_ms = max(0.0, float(getattr(perf, "t_p_eval_ms", 0.0) or 0.0))
+        generation_ms = max(0.0, float(getattr(perf, "t_eval_ms", 0.0) or 0.0))
+
+        return {
+            "token_source": "llama.cpp perf counters",
+            "prompt_tokens": prompt_tokens,
+            "prompt_eval_tokens": prompt_eval_tokens,
+            "reused_prompt_tokens": reused_prompt_tokens,
+            "kv_prefix_reuse_pct": (
+                round(reused_prompt_tokens * 100.0 / prompt_tokens, 2)
+                if prompt_tokens > 0
+                else 0.0
+            ),
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+            "context_tokens": context_tokens,
+            "context_window": CTX_SIZE,
+            "context_usage_pct": (
+                round(context_tokens * 100.0 / CTX_SIZE, 2)
+                if CTX_SIZE > 0
+                else 0.0
+            ),
+            "prompt_eval_ms": round(prompt_eval_ms, 2),
+            "generation_ms": round(generation_ms, 2),
+            "prompt_eval_tps": (
+                round(prompt_eval_tokens * 1000.0 / prompt_eval_ms, 2)
+                if prompt_eval_tokens > 0 and prompt_eval_ms > 0
+                else 0.0
+            ),
+            "generation_tps": (
+                round(completion_tokens * 1000.0 / generation_ms, 2)
+                if completion_tokens > 0 and generation_ms > 0
+                else 0.0
+            ),
+            # llama.cpp documents n_reused as compute-graph reuse count.
+            # It is intentionally not presented as a KV-cache hit counter.
+            "graph_reuse_count": int(getattr(perf, "n_reused", 0) or 0),
+        }
+    except Exception as exc:
+        return {"perf_error": str(exc)}
+
+
+def _start_request_metrics(
+    *,
+    request_id: str,
+    payload: Dict[str, Any],
+    started_at: float,
+) -> None:
+    messages = payload.get("messages")
+    tools = payload.get("tools")
+    active = {
+        "request_id": request_id,
+        "status": "running",
+        "kind": _classify_request(payload),
+        "timestamp": int(time.time()),
+        "model": MODEL_ID,
+        "backend": engine_instance.mode,
+        "stream": bool(payload.get("stream", False)),
+        "messages": len(messages) if isinstance(messages, list) else 0,
+        "tools": len(tools) if isinstance(tools, list) else 0,
+        "requested_max_tokens": payload.get("max_tokens"),
+        "effective_max_tokens": payload.get("max_tokens"),
+        "reasoning_filter": REASONING_FILTER_MODE,
+        "elapsed_ms": 0.0,
+        "backend_ttft_ms": None,
+        "visible_ttft_ms": None,
+        **_process_memory_snapshot(),
+    }
+    with METRICS_LOCK:
+        RUNTIME_METRICS["active_request"] = active
+
+
+def _update_active_metrics(
+    *,
+    request_id: str,
+    started_at: float,
+    backend_ttft_ms: Optional[float] = None,
+    visible_ttft_ms: Optional[float] = None,
+) -> None:
+    snapshot = _gguf_perf_snapshot()
+    memory = _process_memory_snapshot()
+
+    with METRICS_LOCK:
+        active = RUNTIME_METRICS.get("active_request")
+        if not isinstance(active, dict) or active.get("request_id") != request_id:
+            return
+
+        active["elapsed_ms"] = round((time.perf_counter() - started_at) * 1000.0, 2)
+        if backend_ttft_ms is not None:
+            active["backend_ttft_ms"] = round(backend_ttft_ms, 2)
+        if visible_ttft_ms is not None:
+            active["visible_ttft_ms"] = round(visible_ttft_ms, 2)
+        active.update(snapshot)
+        active.update(memory)
+
+
+def _finish_request_metrics(
+    *,
+    request_id: str,
+    started_at: float,
+    payload: Dict[str, Any],
+    backend_ttft_ms: Optional[float] = None,
+    visible_ttft_ms: Optional[float] = None,
+    usage: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+    snapshot = _gguf_perf_snapshot()
+
+    # Non-GGUF backends already expose OpenAI-style usage. Keep it when
+    # llama.cpp counters are unavailable.
+    if not snapshot and isinstance(usage, dict):
+        prompt_tokens = usage.get("prompt_tokens")
+        completion_tokens = usage.get("completion_tokens")
+        total_tokens = usage.get("total_tokens")
+        if isinstance(prompt_tokens, int):
+            snapshot["prompt_tokens"] = prompt_tokens
+        if isinstance(completion_tokens, int):
+            snapshot["completion_tokens"] = completion_tokens
+        if isinstance(total_tokens, int):
+            snapshot["total_tokens"] = total_tokens
+            snapshot["context_tokens"] = total_tokens
+            snapshot["context_window"] = CTX_SIZE
+            snapshot["context_usage_pct"] = round(total_tokens * 100.0 / CTX_SIZE, 2)
+
+    messages = payload.get("messages")
+    tools = payload.get("tools")
+    record = {
+        "request_id": request_id,
+        "status": "complete",
+        "kind": _classify_request(payload),
+        "timestamp": int(time.time()),
+        "model": MODEL_ID,
+        "backend": engine_instance.mode,
+        "stream": bool(payload.get("stream", False)),
+        "messages": len(messages) if isinstance(messages, list) else 0,
+        "tools": len(tools) if isinstance(tools, list) else 0,
+        "effective_max_tokens": payload.get("max_tokens"),
+        "reasoning_filter": REASONING_FILTER_MODE,
+        "wall_time_ms": round(elapsed_ms, 2),
+        "backend_ttft_ms": round(backend_ttft_ms, 2) if backend_ttft_ms is not None else None,
+        "visible_ttft_ms": round(visible_ttft_ms, 2) if visible_ttft_ms is not None else None,
+        **snapshot,
+        **_process_memory_snapshot(),
+    }
+
+    with METRICS_LOCK:
+        RUNTIME_METRICS["requests_total"] += 1
+        active = RUNTIME_METRICS.get("active_request")
+        if isinstance(active, dict) and active.get("request_id") == request_id:
+            RUNTIME_METRICS["active_request"] = None
+        RUNTIME_METRICS["last_request"] = record
+
+        history = RUNTIME_METRICS.get("history")
+        if not isinstance(history, list):
+            history = []
+            RUNTIME_METRICS["history"] = history
+        history.append(copy.deepcopy(record))
+        if len(history) > METRICS_HISTORY_LIMIT:
+            del history[:-METRICS_HISTORY_LIMIT]
+
+    print(
+        "[Perf] "
+        f"kind={record.get('kind')} | "
+        f"prompt={record.get('prompt_tokens', '?')} "
+        f"(eval={record.get('prompt_eval_tokens', '?')}, reused={record.get('reused_prompt_tokens', '?')}) | "
+        f"completion={record.get('completion_tokens', '?')} | "
+        f"ctx={record.get('context_tokens', '?')}/{CTX_SIZE} "
+        f"({record.get('context_usage_pct', '?')}%) | "
+        f"PP={record.get('prompt_eval_tps', '?')} tok/s | "
+        f"TG={record.get('generation_tps', '?')} tok/s | "
+        f"KV-prefix={record.get('kv_prefix_reuse_pct', '?')}% | "
+        f"TTFT(raw)={record.get('backend_ttft_ms')}ms | "
+        f"TTFT(visible)={record.get('visible_ttft_ms')}ms | "
+        f"wall={record.get('wall_time_ms')}ms"
+    )
+
+    return record
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -728,44 +1186,161 @@ def _validate_chat_payload(payload: Any) -> Dict[str, Any]:
     return normalized
 
 
-def _sse_from_chunks(chunks: Iterable[Dict[str, Any]]) -> Iterator[str]:
+def _sse_from_chunks(
+    chunks: Iterable[Dict[str, Any]],
+    *,
+    request_id: str,
+    started_at: float,
+    payload: Dict[str, Any],
+    include_usage: bool = False,
+) -> Iterator[str]:
     thinker = ThinkingStreamFilter()
-    for chunk in chunks:
-        chunk = _normalize_stream_chunk(chunk)
-        choices = chunk.get("choices", [])
-        if isinstance(choices, list):
-            for choice in choices:
-                if not isinstance(choice, dict):
-                    continue
-                delta = choice.get("delta")
-                if not isinstance(delta, dict):
-                    continue
-                if isinstance(delta.get("content"), str):
-                    filtered = thinker.feed(delta["content"])
-                    if filtered:
-                        delta["content"] = filtered
-                    else:
-                        delta.pop("content", None)
-        yield f"data: {_json_dumps(chunk)}\n\n"
 
-    remaining = thinker.flush()
-    if remaining:
-        tail_chunk = {
-            "id": f"chatcmpl-{uuid.uuid4().hex}",
-            "object": "chat.completion.chunk",
-            "created": int(time.time()),
-            "model": MODEL_ID,
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": {"content": remaining},
-                    "finish_reason": None,
-                }
-            ],
-        }
-        yield f"data: {_json_dumps(tail_chunk)}\n\n"
+    backend_ttft_ms: Optional[float] = None
+    visible_ttft_ms: Optional[float] = None
+    pending_finish_reason = None
+    pending_finish_index = 0
+    last_live_update = 0.0
+    stream_id = f"chatcmpl-{uuid.uuid4().hex}"
+    stream_created = int(time.time())
 
-    yield "data: [DONE]\n\n"
+    try:
+        for chunk in chunks:
+            chunk = _normalize_stream_chunk(chunk)
+            stream_id = str(chunk.get("id") or stream_id)
+            stream_created = int(chunk.get("created") or stream_created)
+
+            choices = chunk.get("choices", [])
+            if isinstance(choices, list):
+                for choice in choices:
+                    if not isinstance(choice, dict):
+                        continue
+
+                    delta = choice.get("delta")
+                    if isinstance(delta, dict):
+                        raw_content = delta.get("content")
+                        tool_calls = delta.get("tool_calls")
+
+                        if backend_ttft_ms is None and (
+                            (isinstance(raw_content, str) and raw_content)
+                            or (isinstance(tool_calls, list) and tool_calls)
+                        ):
+                            backend_ttft_ms = (time.perf_counter() - started_at) * 1000.0
+
+                        if isinstance(raw_content, str):
+                            filtered = thinker.feed(raw_content)
+                            if filtered:
+                                if visible_ttft_ms is None:
+                                    visible_ttft_ms = (time.perf_counter() - started_at) * 1000.0
+                                delta["content"] = filtered
+                            else:
+                                delta.pop("content", None)
+
+                        if (
+                            visible_ttft_ms is None
+                            and isinstance(tool_calls, list)
+                            and tool_calls
+                        ):
+                            visible_ttft_ms = (time.perf_counter() - started_at) * 1000.0
+
+                    finish_reason = choice.get("finish_reason")
+                    if finish_reason is not None and thinker.mode != "pass":
+                        pending_finish_reason = finish_reason
+                        pending_finish_index = choice.get("index", 0)
+                        choice["finish_reason"] = None
+
+            now = time.perf_counter()
+            if now - last_live_update >= 0.5:
+                _update_active_metrics(
+                    request_id=request_id,
+                    started_at=started_at,
+                    backend_ttft_ms=backend_ttft_ms,
+                    visible_ttft_ms=visible_ttft_ms,
+                )
+                last_live_update = now
+
+            yield f"data: {_json_dumps(chunk)}\n\n"
+
+        remaining = thinker.flush()
+        if remaining:
+            if visible_ttft_ms is None:
+                visible_ttft_ms = (time.perf_counter() - started_at) * 1000.0
+
+            tail_chunk = {
+                "id": stream_id,
+                "object": "chat.completion.chunk",
+                "created": stream_created,
+                "model": MODEL_ID,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": remaining},
+                        "finish_reason": None,
+                    }
+                ],
+            }
+            yield f"data: {_json_dumps(tail_chunk)}\n\n"
+
+        if pending_finish_reason is not None:
+            finish_chunk = {
+                "id": stream_id,
+                "object": "chat.completion.chunk",
+                "created": stream_created,
+                "model": MODEL_ID,
+                "choices": [
+                    {
+                        "index": pending_finish_index,
+                        "delta": {},
+                        "finish_reason": pending_finish_reason,
+                    }
+                ],
+            }
+            yield f"data: {_json_dumps(finish_chunk)}\n\n"
+
+        final_record = _finish_request_metrics(
+            request_id=request_id,
+            started_at=started_at,
+            payload=payload,
+            backend_ttft_ms=backend_ttft_ms,
+            visible_ttft_ms=visible_ttft_ms,
+        )
+
+        if include_usage:
+            usage = {
+                "prompt_tokens": int(final_record.get("prompt_tokens", 0) or 0),
+                "completion_tokens": int(final_record.get("completion_tokens", 0) or 0),
+                "total_tokens": int(final_record.get("total_tokens", 0) or 0),
+            }
+            usage_chunk = {
+                "id": stream_id,
+                "object": "chat.completion.chunk",
+                "created": stream_created,
+                "model": MODEL_ID,
+                "choices": [],
+                "usage": usage,
+            }
+            yield f"data: {_json_dumps(usage_chunk)}\n\n"
+
+        yield "data: [DONE]\n\n"
+
+    except GeneratorExit:
+        _finish_request_metrics(
+            request_id=request_id,
+            started_at=started_at,
+            payload=payload,
+            backend_ttft_ms=backend_ttft_ms,
+            visible_ttft_ms=visible_ttft_ms,
+        )
+        raise
+    except Exception:
+        _finish_request_metrics(
+            request_id=request_id,
+            started_at=started_at,
+            payload=payload,
+            backend_ttft_ms=backend_ttft_ms,
+            visible_ttft_ms=visible_ttft_ms,
+        )
+        raise
 
 
 def _sse_from_complete_response(response: Dict[str, Any], stream_options: Optional[Dict[str, Any]] = None) -> Iterator[str]:
@@ -813,6 +1388,24 @@ def _sse_from_complete_response(response: Dict[str, Any], stream_options: Option
     yield "data: [DONE]\n\n"
 
 
+@app.get("/metrics")
+async def metrics(token: str = Depends(verify_token)):
+    with METRICS_LOCK:
+        payload = copy.deepcopy(RUNTIME_METRICS)
+
+    payload["server"] = {
+        "pid": os.getpid(),
+        "model": MODEL_ID,
+        "backend": engine_instance.mode,
+        "context_window": CTX_SIZE,
+        "max_output_tokens": MAX_OUTPUT_TOKENS,
+        "reasoning_filter": REASONING_FILTER_MODE,
+        "uptime_s": max(0, int(time.time()) - SERVER_CREATED),
+        **_process_memory_snapshot(),
+    }
+    return payload
+
+
 @app.get("/v1/models")
 async def list_models(token: str = Depends(verify_token)):
     return {
@@ -839,16 +1432,27 @@ async def health(token: str = Depends(verify_token)):
         "model": MODEL_ID,
         "context_size": CTX_SIZE,
         "max_output_tokens": MAX_OUTPUT_TOKENS,
+        "reasoning_filter": REASONING_FILTER_MODE,
     }
 
 
 @app.post("/v1/chat/completions")
 async def chat_endpoint(request: Request, token: str = Depends(verify_token)):
     raw_payload: Any = None
+    started_at = time.perf_counter()
+    request_id = uuid.uuid4().hex[:12]
+
     try:
         raw_payload = await request.json()
         print(f"[Request] Chat Completions | {_request_summary(raw_payload)}")
+
         payload = _validate_chat_payload(raw_payload)
+        _start_request_metrics(
+            request_id=request_id,
+            payload=payload,
+            started_at=started_at,
+        )
+
         result, native_stream = engine_instance.generate_response(payload)
 
         if payload.get("stream"):
@@ -857,23 +1461,63 @@ async def chat_endpoint(request: Request, token: str = Depends(verify_token)):
                 "Connection": "keep-alive",
                 "X-Accel-Buffering": "no",
             }
+
+            stream_options = payload.get("stream_options")
+            include_usage = bool(
+                isinstance(stream_options, dict)
+                and stream_options.get("include_usage")
+            )
+
             if native_stream:
                 return StreamingResponse(
-                    _sse_from_chunks(result),
+                    _sse_from_chunks(
+                        result,
+                        request_id=request_id,
+                        started_at=started_at,
+                        payload=payload,
+                        include_usage=include_usage,
+                    ),
                     media_type="text/event-stream",
                     headers=headers,
                 )
+
+            # Non-native stream backends already return a complete response.
+            # Record its metrics before adapting it to SSE.
+            filtered = _filter_response_message(result)
+            usage = filtered.get("usage") if isinstance(filtered, dict) else None
+            elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+            _finish_request_metrics(
+                request_id=request_id,
+                started_at=started_at,
+                payload=payload,
+                backend_ttft_ms=elapsed_ms,
+                visible_ttft_ms=elapsed_ms,
+                usage=usage if isinstance(usage, dict) else None,
+            )
             return StreamingResponse(
-                _sse_from_complete_response(result, payload.get("stream_options")),
+                _sse_from_complete_response(filtered, stream_options),
                 media_type="text/event-stream",
                 headers=headers,
             )
 
-        # 非流式响应统一过滤思考内容
-        return _filter_response_message(result)
+        filtered = _filter_response_message(result)
+        usage = filtered.get("usage") if isinstance(filtered, dict) else None
+        elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+        _finish_request_metrics(
+            request_id=request_id,
+            started_at=started_at,
+            payload=payload,
+            backend_ttft_ms=elapsed_ms,
+            visible_ttft_ms=elapsed_ms,
+            usage=usage if isinstance(usage, dict) else None,
+        )
+        return filtered
 
     except HTTPException as exc:
-        print(f"[RequestRejected] status={exc.status_code} detail={exc.detail} | {_request_summary(raw_payload)}")
+        print(
+            f"[RequestRejected] status={exc.status_code} detail={exc.detail} | "
+            f"{_request_summary(raw_payload)}"
+        )
         raise
     except json.JSONDecodeError:
         print("[RequestRejected] status=400 detail=Request body is not valid JSON")
