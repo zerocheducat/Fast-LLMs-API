@@ -1,42 +1,73 @@
-# Local LLM Service Console
+# Fast LLMs API — Local OpenAI-compatible Service Console
 
 [**中文**](./README_zh-CN.md) | **English**
 
-This is a lightweight local Large Language Model (LLM) service deployment and management console. The project provides a Gradio-based graphical launcher and a high-performance inference backend based on FastAPI, dedicated to simplifying the configuration and invocation process of local AI models.
+A lightweight local LLM deployment and management console. It ships a Gradio-based graphical launcher (`launcher.py`), a FastAPI-based OpenAI-compatible inference backend (`core_api.py`), and a terminal performance monitor (`monitor.py`). The goal is to make local model deployment, secure API exposure, and runtime observation simple and reproducible.
 
 ## Core Advantages
 
-- **Extremely Lightweight, Out-of-the-Box**: Say goodbye to bloated and complex dependencies and configurations. Adopting a pure and lightweight architecture design with an intuitive graphical interface, even beginners can launch their exclusive large model service with a single click.
-- **Truly Zero Cost**: Completely break free from the anxiety of expensive Token billing from cloud APIs. Enjoy unlimited, smooth conversations—your only investment is the local hardware providing the computational support.
-- **Zero Latency & Absolute Privacy**: Data flows entirely within your local device. Not only do you enjoy lightning-fast responses that bypass network bottlenecks, but your core privacy is also fundamentally safeguarded.
+- **Extremely Lightweight, Out-of-the-Box**: Pure and minimal architecture with a graphical launcher. Launch a local OpenAI-compatible service with a single click.
+- **Truly Zero Cost**: No cloud token billing. Your only investment is the local hardware.
+- **Zero Latency & Absolute Privacy**: All data stays on your machine. No network round-trip, no data leakage.
+- **Observable by Design**: Built-in `/metrics` endpoint plus a live terminal dashboard (GPU, VRAM, tokens, throughput, KV prefix reuse, TTFT).
 
 ## Core Features
-- **Multi-Engine Support**: The backend seamlessly integrates with GGUF (via `llama-cpp-python`), Transformers, and Ollama proxy modes.
-- **Graphical Launcher**: Visually select model paths, customize Context Size, and set service ports.
-- **Intelligent Hardware Monitoring**: Automatically detects NVIDIA GPU status and accurately estimates VRAM usage based on model size before loading, effectively preventing OOM (Out of Memory) risks.
-- **Security Authentication**: Built-in dynamic API Key generation and binding to ensure secure invocation of local API endpoints.
-- **Built-in API Debugging Panel**: The console integrates a chat testing component to send real-time requests and view underlying JSON responses.
+
+- **Multi-Engine Backend**
+  - GGUF via `llama-cpp-python` (CUDA accelerated with `n_gpu_layers=-1`)
+  - Transformers with native `apply_chat_template` / `parse_response` support
+  - Ollama OpenAI-compatible proxy mode
+- **Graphical Launcher (Gradio)**
+  - Visual model selection (Ollama list + GGUF folder scanning + custom Transformers directory)
+  - Configurable Context Window, Max Output Tokens, Service Port
+  - Bilingual UI (English / 简体中文)
+- **Intelligent Hardware Monitoring**
+  - Detects NVIDIA GPU via `nvidia-smi`
+  - Estimates VRAM usage from model file size before loading (GGUF)
+  - Live refresh from the launcher
+- **Security Authentication**
+  - Bearer token (`Authorization: Bearer <key>`) on every endpoint
+  - Per-model persistent API key stored in `model_api_keys.json`
+  - SHA-256 fingerprint written to `service_access.log` on key creation
+- **Reasoning / Thinking Filter**
+  - Handles `<think>...</think>` and gpt-oss / Harmony channel markers
+  - Three modes:
+    - `strict`: safest — buffers untagged output until a final marker or end of stream
+    - `tagged`: only filters when an explicit reasoning tag is detected
+    - `off`: pass raw model output
+- **OpenAI-Compatible API Surface**
+  - `POST /v1/chat/completions` (streaming SSE and non-streaming)
+  - `GET /v1/models`
+  - `GET /health`
+  - `GET /metrics` (runtime + history + hardware snapshot)
+  - Supports `max_completion_tokens`, `max_tokens`, `tools`, `tool_choice`, `stop`, `seed`, `response_format`, `stream_options.include_usage`, etc.
+- **Built-in API Debug Panel**
+  - Chat Completions test
+  - `/v1/models` test
+  - Tool Calling test
+  - DeepSeek Harness compatibility probe (`max_completion_tokens` + SSE + usage + tool_calls)
+- **DeepSeek Harness Integration**
+  - Generates provider configuration and a `settings.yaml` snippet
+  - Uses `apiKeyEnv` reference instead of plaintext keys
+- **Terminal Performance Monitor**
+  - No third-party dependency
+  - Live GPU / VRAM / temperature / power
+  - Token budget, prompt eval / generation tok/s, KV prefix reuse, TTFT (raw & visible), wall time
+  - Recent request history sparkline
 
 ## Requirements
-- Python 3.10.0 to 3.12.0 is recommended (The default development environment uses UTF-8 encoding).
-- An NVIDIA GPU is highly recommended to enable CUDA hardware acceleration.
 
-## Installation & Usage
+- Python 3.10.0 – 3.12.0 (the default development environment uses UTF-8 encoding)
+- Recommended: NVIDIA GPU with CUDA for hardware acceleration
+- Optional backends:
+  - `llama-cpp-python` for GGUF
+  - `transformers` + `torch` for Transformers mode
+  - Ollama running locally for proxy mode
 
-1. Clone this repository to your local machine:
+## Installation
+
+1. Clone the repository:
+
    ```bash
-   git clone [https://github.com/YourUsername/YourRepository.git](https://github.com/YourUsername/YourRepository.git)
+   git clone https://github.com/YourUsername/YourRepository.git
    cd YourRepository
-   ```
-2. Install the required dependencies:
-
-   ```Bash
-   pip install -r requirements.txt
-   ```
-3. Launch the service console:
-Double-click web_api.bat to run, or execute directly in the command line:
-
-   ```Bash
-   python launcher.py
-   ```
-4. Configure the model in the automatically opened browser window and click "Start Service" to obtain the OpenAI-compatible API address.
